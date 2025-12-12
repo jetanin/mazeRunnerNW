@@ -2,6 +2,13 @@ package com.nw.maze;
 
 import java.util.Comparator;
 import java.util.PriorityQueue;
+import java.awt.Dimension;
+import java.awt.Toolkit;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.util.function.Function;
 
 // import org.springframework.CollectionUtils;
 
@@ -10,14 +17,37 @@ public class Main {
     private static final int directions[][] = { { -1, 0 }, { 0, 1 }, { 1, 0 }, { 0, -1 } };
     // private static final String FILE_NAME = "src/com/nw/maze/maze_101_101.txt";
     private static final String FILE_NAME = "m100_100.txt";
-    private static final int BLOCK_SIZE = 20;
+    private static final int DEFAULT_BLOCK_SIZE = 20;
+    private static final int MIN_BLOCK_SIZE = 4;   // Smallest visible cell
+    private static final int MAX_BLOCK_SIZE = 80;  // Cap so small mazes don't blow up
 
     MazeFrame frame;
     MazeData data;
 
     public void initFrame() {
         data = new MazeData(FILE_NAME);
-        frame = new MazeFrame("Maze Solver", data.M() * BLOCK_SIZE, data.N() * BLOCK_SIZE);
+        // collect maze files from current directory
+        String[] mazeFiles = listMazeFiles();
+        // compute block size so the maze fits in the user screen
+        Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
+        int screenW = (int) screen.getWidth();
+        int screenH = (int) screen.getHeight();
+        // leave some space for OS chrome / controls
+        int maxSceneW = Math.max(300, screenW - 150);
+        int maxSceneH = Math.max(200, screenH - 150);
+        int blockSize = DEFAULT_BLOCK_SIZE;
+        // try to keep DEFAULT_BLOCK_SIZE but shrink until maze fits
+        while (blockSize > MIN_BLOCK_SIZE && (blockSize * data.M() > maxSceneW || blockSize * data.N() > maxSceneH)) {
+            blockSize--;
+        }
+        if (blockSize < MIN_BLOCK_SIZE) blockSize = MIN_BLOCK_SIZE;
+        if (blockSize > MAX_BLOCK_SIZE) blockSize = MAX_BLOCK_SIZE;
+
+        int frameW = Math.min(blockSize * data.M(), maxSceneW);
+        int frameH = Math.min(blockSize * data.N(), maxSceneH);
+        frame = new MazeFrame("Maze Solver", frameW, frameH, mazeFiles);
+        frame.setResizable(true);
+        frame.setLocationRelativeTo(null);
         frame.setControlListener(new MazeFrame.ControlListener() {
             @Override
             public void onRunRequested(String algorithmName) {
@@ -33,9 +63,50 @@ public class Main {
             }
             @Override
             public void onResetRequested() { resetState(); }
+            @Override
+            public void onMazeSelected(String mazeFile) {
+                // Load maze on EDT to avoid concurrency issues with renderer
+                javax.swing.SwingUtilities.invokeLater(() -> reloadMaze(mazeFile));
+            }
         });
+        frame.setSelectedMaze(FILE_NAME);
         frame.render(data);
         // Wait for user to press Run; no auto-execution
+    }
+
+    private String[] listMazeFiles() {
+        java.io.File dir = new java.io.File(".");
+        java.io.File[] files = dir.listFiles((d, name) -> name.toLowerCase().endsWith(".txt"));
+        if (files == null) return new String[] { FILE_NAME };
+        java.util.Arrays.sort(files, java.util.Comparator.comparing(java.io.File::getName));
+        String[] names = new String[files.length];
+        for (int i = 0; i < files.length; i++) names[i] = files[i].getName();
+        return names;
+    }
+
+    private void reloadMaze(String fileName) {
+        try {
+            // Replace data with new maze, recompute frame size based on screen and maze size
+            data = new MazeData(fileName);
+            // compute block size & frame size same as init
+            Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
+            int screenW = (int) screen.getWidth();
+            int screenH = (int) screen.getHeight();
+            int maxSceneW = Math.max(300, screenW - 150);
+            int maxSceneH = Math.max(200, screenH - 150);
+            int blockSize = DEFAULT_BLOCK_SIZE;
+            while (blockSize > MIN_BLOCK_SIZE && (blockSize * data.M() > maxSceneW || blockSize * data.N() > maxSceneH)) blockSize--;
+            if (blockSize < MIN_BLOCK_SIZE) blockSize = MIN_BLOCK_SIZE;
+            if (blockSize > MAX_BLOCK_SIZE) blockSize = MAX_BLOCK_SIZE;
+            int frameW = Math.min(blockSize * data.M(), maxSceneW);
+            int frameH = Math.min(blockSize * data.N(), maxSceneH);
+            frame.setCanvasSize(frameW, frameH);
+            frame.setTitle("Maze Solver - " + fileName);
+            resetState();
+            frame.render(data);
+        } catch (Exception e) {
+            System.err.println("Failed to load maze: " + fileName + " -> " + e.getMessage());
+        }
     }
 
     private void resetState() {
@@ -153,7 +224,7 @@ public class Main {
     }
 
     private void runBFS() {
-        java.util.ArrayDeque<Position> queue = new java.util.ArrayDeque<>();
+        ArrayDeque<Position> queue = new ArrayDeque<>();
         Position entrance = new Position(data.getEntranceX(), data.getEntranceY(), null);
         queue.add(entrance);
         if (data.inArea(entrance.x, entrance.y)) data.visited[entrance.x][entrance.y] = true;
@@ -258,18 +329,26 @@ public class Main {
     private void runGenetic() {
         // Simple genetic algorithm: evolve sequences of moves with fitness = path cost to reach goal (penalize walls)
         final int maxGenerations = 200;
-        final int populationSize = 100;
-        final int genomeLength = data.N() * data.M(); // upper bound on steps
-        java.util.Random rnd = new java.util.Random(42);
+        final int populationSize = 200;
+        // genome length will be dynamic based on maze size
+        Random rnd = new Random(42);
 
-        // Helper to evaluate a genome
-        class EvalResult { int cost; int steps; int visited; int visitedWeight; java.util.List<int[]> path; boolean reached; }
-        java.util.function.Function<int[], EvalResult> evaluate = genome -> {
+        // Precompute distance map (BFS from goal) once for this run, used by the fitness function.
+        final int[][] distMap = computeDistanceMap();
+
+        // dynamic genome length bounds: min and max derived from maze size
+        int maxGenomeLength = data.N() * data.M(); // upper bound
+        int minGenomeLength = Math.max(10, Math.min(100, (data.N() + data.M()) * 2)); // reasonable lower bound
+        if (minGenomeLength > maxGenomeLength) minGenomeLength = maxGenomeLength;
+
+        // Helper to evaluate a genome (add fitness field)
+        class EvalResult { int cost; int steps; int visited; int visitedWeight; List<int[]> path; boolean reached; int bfsDistance; double fitness; }
+        Function<int[], EvalResult> evaluate = genome -> {
             // reset temp visited
             boolean[][] seen = new boolean[data.N()][data.M()];
             int x = data.getEntranceX(), y = data.getEntranceY();
             int cost = 0, steps = 0, visited = 0, visitedWeightSum = 0;
-            java.util.ArrayList<int[]> path = new java.util.ArrayList<>();
+            ArrayList<int[]> path = new ArrayList<>();
             path.add(new int[]{x,y});
             seen[x][y] = true; visited++;
             int startW = data.weight!=null?data.weight[x][y]:1; visitedWeightSum += (startW>0?startW:1);
@@ -286,53 +365,139 @@ public class Main {
                 path.add(new int[]{x,y});
                 if (x==data.getExitX() && y==data.getExitY()) break;
             }
-            EvalResult r = new EvalResult(); r.cost=cost; r.steps=steps; r.visited=visited; r.visitedWeight=visitedWeightSum; r.path=path; r.reached=(x==data.getExitX() && y==data.getExitY()); return r;
-        };
+            EvalResult r = new EvalResult(); r.cost=cost; r.steps=steps; r.visited=visited; r.visitedWeight=visitedWeightSum; r.path=path; r.reached=(x==data.getExitX() && y==data.getExitY());
+            // Use precomputed distance map; if out-of-area or unreachable, keep Integer.MAX_VALUE
+            if (!data.inArea(x, y)) r.bfsDistance = Integer.MAX_VALUE;
+            else r.bfsDistance = distMap != null ? distMap[x][y] : bfsDistance(x, y);
+            // Compute fitness:
+            // validRatioScore = (stepsValid / genomeLength) * 50.0
+            // progressScore = ((distStart - distCurrent) / (double) distStart) * 50.0
+            // if reached goal: fitness = 1000 + (genomeLength - stepsTaken)
+            int sx = data.getEntranceX(), sy = data.getEntranceY();
+            int distStart = (data.inArea(sx, sy) && distMap!=null) ? distMap[sx][sy] : Integer.MAX_VALUE;
+            double validRatioScore = genome.length > 0 ? (steps / (double) genome.length) * 50.0 : 0.0;
+            double progressScore = 0.0;
+            if (distStart > 0 && distStart != Integer.MAX_VALUE) {
+                double distCur = r.bfsDistance == Integer.MAX_VALUE ? distStart : r.bfsDistance;
+                progressScore = ((distStart - distCur) / (double) distStart) * 50.0;
+                if (progressScore < 0.0) progressScore = 0.0;
+            }
+            if (r.reached) {
+                r.fitness = 1000.0 + (genome.length - r.steps);
+            } else {
+                r.fitness = validRatioScore + progressScore;
+            }
+             return r;
+         };
 
         // Initialize population
-        java.util.List<int[]> pop = new java.util.ArrayList<>();
-        for (int i=0;i<populationSize;i++){ int[] g=new int[genomeLength]; for(int j=0;j<genomeLength;j++) g[j]=rnd.nextInt(4); pop.add(g); }
+        List<int[]> pop = new ArrayList<>();
+        for (int i=0;i<populationSize;i++){
+            int len = minGenomeLength + (maxGenomeLength==minGenomeLength ? 0 : rnd.nextInt(maxGenomeLength - minGenomeLength + 1));
+            int[] g=new int[len];
+            for(int j=0;j<len;j++) g[j]=rnd.nextInt(4);
+            pop.add(g);
+        }
 
-        int bestCost = Integer.MAX_VALUE, bestSteps=0, bestVisited=0, bestVisitedWeight=0; java.util.List<int[]> bestPath=null; String algoName="Genetic";
+        double bestScore = Double.NEGATIVE_INFINITY; Integer bestCost = null; int bestSteps=0, bestVisited=0, bestVisitedWeight=0; List<int[]> bestPath=null; String algoName="Genetic";
         long t0 = System.nanoTime();
         for (int gen=0; gen<maxGenerations; gen++) {
             // Evaluate
-            java.util.List<EvalResult> results = new java.util.ArrayList<>(populationSize);
+            List<EvalResult> results = new ArrayList<>(populationSize);
             for (int[] g : pop) results.add(evaluate.apply(g));
-            // Select top 20%
-            results.sort(java.util.Comparator.comparingInt(r -> r.cost));
-            java.util.List<int[]> next = new java.util.ArrayList<>();
+            // Select top 20% by fitness (descending)
+            List<Integer> indices = new ArrayList<>();
+            for (int i=0;i<results.size();i++) indices.add(i);
+            indices.sort((a,b) -> Double.compare(results.get(b).fitness, results.get(a).fitness));
+            List<int[]> next = new ArrayList<>();
             int eliteCount = Math.max(1, populationSize/5);
-            for (int i=0;i<eliteCount;i++) next.add(pop.get(i));
+            for (int i=0;i<eliteCount;i++) next.add(pop.get(indices.get(i)));
             // Track best
-            EvalResult br = results.get(0);
-            if (br.cost < bestCost) { bestCost=br.cost; bestSteps=br.steps; bestVisited=br.visited; bestVisitedWeight=br.visitedWeight; bestPath=br.path; }
+            EvalResult br = results.get(indices.get(0));
+            if (br.fitness > bestScore) { bestScore = br.fitness; bestSteps=br.steps; bestVisited=br.visited; bestVisitedWeight=br.visitedWeight; bestPath=br.path; if (br.reached) { if (bestCost==null || br.cost < bestCost) bestCost = br.cost; } }
             // Crossover + mutation to refill
             while (next.size() < populationSize) {
                 int[] p1 = pop.get(rnd.nextInt(eliteCount));
                 int[] p2 = pop.get(rnd.nextInt(eliteCount));
-                int[] child = new int[genomeLength];
-                int cut = rnd.nextInt(genomeLength);
-                System.arraycopy(p1, 0, child, 0, cut);
-                System.arraycopy(p2, cut, child, cut, genomeLength-cut);
-                // mutation
-                for (int m=0;m<genomeLength/20;m++) child[rnd.nextInt(genomeLength)] = rnd.nextInt(4);
-                next.add(child);
-            }
-            pop = next;
-            // Occasionally update UI with best metrics
+                // child length can vary; average + small noise or random within bounds
+                int childLen = minGenomeLength + (maxGenomeLength==minGenomeLength ? 0 : rnd.nextInt(maxGenomeLength - minGenomeLength + 1));
+                int[] child = new int[childLen];
+                // pick cut points in parents
+                int cut1 = rnd.nextInt(p1.length + 1);
+                int cut2 = rnd.nextInt(p2.length + 1);
+                // copy prefix from parent1
+                int copyFromP1 = Math.min(cut1, childLen);
+                if (copyFromP1 > 0) System.arraycopy(p1, 0, child, 0, copyFromP1);
+                // fill remaining from p2 starting at cut2 with wrap
+                int pos = copyFromP1;
+                while (pos < childLen) {
+                    child[pos] = p2[(cut2 + (pos - copyFromP1)) % p2.length];
+                    pos++;
+                }
+                // mutation (gene replacement / insertion / deletion)
+                int numMutations = Math.max(1, child.length / 20);
+                for (int m=0;m<numMutations;m++) {
+                    double op = rnd.nextDouble();
+                    if (op < 0.80) {
+                        // replace
+                        child[rnd.nextInt(child.length)] = rnd.nextInt(4);
+                    } else if (op < 0.90 && child.length < maxGenomeLength) {
+                        // insert
+                        int at = rnd.nextInt(child.length + 1);
+                        int[] tmp = new int[child.length + 1];
+                        System.arraycopy(child, 0, tmp, 0, at);
+                        tmp[at] = rnd.nextInt(4);
+                        System.arraycopy(child, at, tmp, at + 1, child.length - at);
+                        child = tmp;
+                    } else if (child.length > minGenomeLength) {
+                        // delete
+                        int at = rnd.nextInt(child.length);
+                        int[] tmp = new int[child.length - 1];
+                        System.arraycopy(child, 0, tmp, 0, at);
+                        System.arraycopy(child, at + 1, tmp, at, child.length - at - 1);
+                        child = tmp;
+                    }
+                }
+                 next.add(child);
+             }
+             pop = next;
+             // Occasionally update UI with best metrics
             if (gen % 10 == 0) frame.updateMetrics(bestCost, bestSteps, bestVisited, (System.nanoTime()-t0)/1_000_000L, algoName, bestVisitedWeight);
-        }
-        long t1 = System.nanoTime();
-        // Render best path
-        resetState();
-        if (bestPath != null) {
-            for (int[] cell : bestPath) {
-                setData(cell[0], cell[1], true);
+         }
+         long t1 = System.nanoTime();
+         // Render best path
+         resetState();
+         if (bestPath != null) {
+             for (int[] cell : bestPath) {
+                 setData(cell[0], cell[1], true);
+             }
+         }
+        frame.updateMetrics(bestCost, bestSteps, bestVisited, (t1-t0)/1_000_000L, algoName, bestVisitedWeight);
+         setData(-1, -1, false);
+     }
+
+    // BFS distance for fitness calculation
+    private int bfsDistance(int sx, int sy) {
+        if (!data.inArea(sx, sy)) return Integer.MAX_VALUE;
+        int rows = data.N(), cols = data.M();
+        boolean[][] seen = new boolean[rows][cols];
+        ArrayDeque<int[]> q = new ArrayDeque<>();
+        q.add(new int[]{sx, sy, 0});
+        seen[sx][sy] = true;
+        while (!q.isEmpty()) {
+            int[] cur = q.poll();
+            int x = cur[0], y = cur[1], d = cur[2];
+            if (x == data.getExitX() && y == data.getExitY()) return d;
+            for (int[] dir : directions) {
+                int nx = x + dir[0], ny = y + dir[1];
+                if (!data.inArea(nx, ny)) continue;
+                if (seen[nx][ny]) continue;
+                if (data.getMazeChar(nx, ny) != MazeData.ROAD) continue;
+                seen[nx][ny] = true;
+                q.add(new int[]{nx, ny, d + 1});
             }
         }
-        frame.updateMetrics(bestCost, bestSteps, bestVisited, (t1-t0)/1_000_000L, algoName, bestVisitedWeight);
-        setData(-1, -1, false);
+        return Integer.MAX_VALUE;
     }
 
     private static class Position {
@@ -372,6 +537,31 @@ public class Main {
             this.cost = cost;
             this.prev = prev;
         }
+    }
+
+    // Compute distance-from-exit map with BFS (distance in steps, Integer.MAX_VALUE = unreachable).
+    private int[][] computeDistanceMap() {
+        int rows = data.N(), cols = data.M();
+        int[][] dist = new int[rows][cols];
+        for (int i = 0; i < rows; i++) for (int j = 0; j < cols; j++) dist[i][j] = Integer.MAX_VALUE;
+        int ex = data.getExitX(), ey = data.getExitY();
+        if (!data.inArea(ex, ey)) return dist;
+        ArrayDeque<int[]> q = new ArrayDeque<>();
+        dist[ex][ey] = 0;
+        q.add(new int[]{ex, ey});
+        while (!q.isEmpty()) {
+            int[] cur = q.poll();
+            int x = cur[0], y = cur[1], d = dist[x][y];
+            for (int[] dir : directions) {
+                int nx = x + dir[0], ny = y + dir[1];
+                if (!data.inArea(nx, ny)) continue;
+                if (dist[nx][ny] != Integer.MAX_VALUE) continue;
+                if (data.getMazeChar(nx, ny) != MazeData.ROAD) continue;
+                dist[nx][ny] = d + 1;
+                q.add(new int[]{nx, ny});
+            }
+        }
+        return dist;
     }
 
     public static void main(String[] args) {
